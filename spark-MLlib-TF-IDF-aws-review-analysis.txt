@@ -1,0 +1,171 @@
+
+val reviews = sc.textFile("aws_reviews/test.ft.txt").map(x => Array(x.slice(0,10),x.slice(11,x.size)))
+
+val rdd = reviews.map( x => {
+  val vsentiment = if (x(0) == "__label__2") "1" else "0"  // 0 = negative, 1 = positive
+  Array(x(1),vsentiment)
+})
+
+rdd.cache
+
+-- remove nonword characters (such as punctuation).
+val nonWordSplit = rdd.flatMap(x => x(0).split("""\W+""").map(_.toLowerCase))
+nonWordSplit.sample(true, 0.3, 42).take(100).mkString(",")
+nonWordSplit.distinct.count   // 259144
+
+-- filter out numbers and tokens that are words mixed with numbers
+val regex = """[^0-9]*""".r
+val filterNumbers = nonWordSplit.filter(token => regex.pattern.matcher(token).matches)
+filterNumbers.sample(false, 0.3, 42).take(100).mkString("\n")
+filterNumbers.distinct.count   // 239332
+
+-- list highest occurrence of words to get an idea which stop words to be removed
+val tokenCounts = filterNumbers.map(t => (t, 1)).reduceByKey(_ + _)
+val orderingDesc = Ordering.by[(String, Int), Int](_._2)
+tokenCounts.top(20)(orderingDesc).mkString("\n")
+
+-- remove stop words
+val stopwords = Set(
+ "the","a","an","of","or","in","for","by","on","but", "is", "not", "with", "as", "was", "if",
+ "they", "are", "this", "and", "it", "have", "from", "at", "my", "be", "that", "to", "so", "what"
+)
+val tokenCountsFilteredStopwords = tokenCounts.filter { case(k, v) => !stopwords.contains(k) }
+tokenCountsFilteredStopwords.top(20)(orderingDesc).mkString("\n")
+
+-- lists tokens greather one-character length
+val tokenCountsFilteredSize = tokenCountsFilteredStopwords.filter { case (k, v) => k.size >= 2 }
+tokenCountsFilteredSize.top(20)(orderingDesc).mkString("\n")
+
+-- list least occurring terms in the corpus
+val orderingAsc = Ordering.by[(String, Int), Int](-_._2)
+tokenCountsFilteredSize.top(20)(orderingAsc).mkString("\n")
+
+-- remove terms with only one-occurrence
+val rareTokens = tokenCounts.filter{ case (k, v) => v < 2 }.map{ case (k, v) => k }.collect.toSet
+val tokenCountsFilteredAll = tokenCountsFilteredSize.filter { case (k, v) => !rareTokens.contains(k) }
+tokenCountsFilteredAll.top(20)(orderingAsc).mkString("\n")
+
+tokenCountsFilteredAll.count
+res24: Long = 112082
+
+def tokenize(line: String): Seq[String] = {
+ line.split("""\W+""")
+ .map(_.toLowerCase)
+ .filter(token => regex.pattern.matcher(token).matches)
+ .filterNot(token => stopwords.contains(token))
+ .filterNot(token => rareTokens.contains(token))
+ .filter(token => token.size >= 2)
+ .toSeq
+}
+
+rdd.flatMap(x => tokenize(x(0))).distinct.count
+res27: Long = 112082
+
+val sets = rdd.randomSplit(Array(0.7,0.3))
+val trainSet = sets(0)
+val testSet = sets(1)
+
+val tokens = trainSet.map(x => tokenize(x(0)))
+tokens.first.take(20)
+
+---------------------------
+
+import org.apache.spark.mllib.linalg.{ SparseVector => SV }
+import org.apache.spark.mllib.feature.HashingTF
+import org.apache.spark.mllib.feature.IDF
+
+val dim = math.pow(2, 18).toInt
+val hashingTF = new HashingTF(dim)
+
+-- transform function of HashingTF maps each input document (that is, a sequence of tokens) to an MLlib Vector.
+val tf = hashingTF.transform(tokens)
+tf.cache
+
+val v = tf.first.asInstanceOf[SV]
+v.size
+v.values.size
+println(v.values.take(10).toSeq)
+println(v.indices.take(10).toSeq)
+
+-- compute the inverse document frequency for each term in the corpus
+-- by creating a new IDF instance and calling fit with our RDD of term frequency
+-- vectors as the input. We will then transform our term frequency vectors to TF-IDF
+-- vectors through the transform function of IDF:
+
+val idf = new IDF().fit(tf)
+val tfidf = idf.transform(tf)
+val v2 = tfidf.first.asInstanceOf[SV]
+println(v2.values.size)
+println(v2.values.take(10).toSeq)
+println(v2.indices.take(10).toSeq)
+
+---------------------
+
+import org.apache.spark.mllib.regression.LabeledPoint
+
+val zippedTrain = trainSet.zip(tfidf)
+val train = zippedTrain.map{ case(text,vector) => LabeledPoint(text(1).toDouble,vector) }
+train.cache
+
+val testTf = testSet.map(x => hashingTF.transform(tokenize(x(0))))
+val testTfIdf = idf.transform(testTf)
+
+val zippedTest = testSet.zip(testTfIdf)
+val test = zippedTest.map{ case(text,vector) => LabeledPoint(text(1).toDouble,vector) }
+test.cache
+
+---- MLlib logistic regression --------------
+
+import org.apache.spark.mllib.classification.LogisticRegressionWithSGD
+val numIterations = 100
+val model = LogisticRegressionWithSGD.train(train, numIterations)
+
+val validPredicts =  test.map(p => (model.predict(p.features),p.label))
+
+validPredicts.take(20)
+res21: Array[(Double, Double)] = Array((1.0,1.0), (1.0,0.0), (0.0,0.0), (1.0,1.0), (0.0,0.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (0.0,0.0), (1.0,1.0), (0.0,1.0), (0.0,1.0), (0.0,0.0), (0.0,0.0))
+
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
+val metrics = new BinaryClassificationMetrics(validPredicts)
+validPredicts.filter(x => x._1 == x._2).count  // 106315
+validPredicts.count                            // 120102
+model.getClass.getSimpleName
+metrics.areaUnderPR   //  0.8602876668760435
+metrics.areaUnderROC  //  0.8852125964258111
+
+---- MLlib SVM regression --------------
+
+import org.apache.spark.mllib.classification.SVMWithSGD
+val numIterations = 100
+val model = SVMWithSGD.train(train, numIterations)
+
+val validPredicts = test.map(x => (model.predict(x.features),x.label))
+
+validPredicts.take(20)
+res27: Array[(Double, Double)] = Array((1.0,1.0), (1.0,0.0), (0.0,0.0), (1.0,1.0), (0.0,0.0), (0.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0), (0.0,0.0), (1.0,1.0), (0.0,1.0), (1.0,1.0), (0.0,0.0), (0.0,0.0))
+
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
+val metrics = new BinaryClassificationMetrics(validPredicts)
+validPredicts.filter(x => x._1 == x._2).count  // 107197
+validPredicts.count                            // 120102
+model.getClass.getSimpleName
+metrics.areaUnderPR   // 0.8687442013511252
+metrics.areaUnderROC  // 0.8925559918080669
+
+---- MLlib Naive Bayes regression --------------
+
+import org.apache.spark.mllib.classification.NaiveBayes
+val model = NaiveBayes.train(train)
+
+val validPredicts = test.map(x => (model.predict(x.features),x.label))
+
+validPredicts.take(20)
+res33: Array[(Double, Double)] = Array((0.0,0.0), (0.0,0.0), (0.0,0.0), (0.0,0.0), (0.0,0.0), (0.0,0.0), (1.0,1.0), (0.0,0.0), (1.0,1.0), (0.0,0.0), (0.0,1.0), (0.0,1.0), (1.0,1.0), (1.0,1.0), (0.0,1.0), (1.0,1.0), (0.0,1.0), (1.0,1.0), (1.0,1.0), (1.0,1.0))
+
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
+val metrics = new BinaryClassificationMetrics(validPredicts)
+validPredicts.filter(x => x._1 == x._2).count  // 97956
+validPredicts.count                            // 120102
+model.getClass.getSimpleName
+metrics.areaUnderPR   //  0.7951289667289874
+metrics.areaUnderROC  //  0.81554228775621
